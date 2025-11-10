@@ -7,7 +7,7 @@ from django.core.exceptions import ImproperlyConfigured
 from aiServer import my_settings
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
-BASE_DIR = Path(__file__).resolve().parent.parent
+BASE_DIR = Path(__file__).resolve().parent
 
 secret_file = os.path.join(BASE_DIR, 'secrets.json')
 
@@ -46,6 +46,8 @@ INSTALLED_APPS = [
     'drf_yasg',
     'rest_framework',
     'stock',
+    'domesticStock',
+    'overseasStock',
     'django_apscheduler',
 ]
 
