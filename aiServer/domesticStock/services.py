@@ -5,22 +5,23 @@ from .models import DomesticStock
 # 국내주식 모두 저장
 def save_all_domestic_stocks() -> int:
     """
-    오늘 기준 전체 국내 주식 목록을 가져와 DB에 저장.
-    이미 존재하는 종목(product_number)은 무시.
-
-    Returns:
-        int: 저장 시도한 전체 종목 개수
+    오늘 기준 전체 국내 주식 목록으로 DB를 동기화.
+    새 종목은 추가하고, 상폐된 종목은 삭제.
     """
-    # 전체 종목코드 조회
     tickers: List[str] = stock.get_market_ticker_list()
+    codes_in_market = set(tickers)
+    codes_in_db = set(DomesticStock.objects.values_list("product_number", flat=True))
 
-    # DB에 저장할 모델 인스턴스 목록
-    domestic_stocks: List[DomesticStock] = [
+    # 새로 생긴 종목 추가
+    new_codes = codes_in_market - codes_in_db
+    new_stocks = [
         DomesticStock(product_number=code, name=stock.get_market_ticker_name(code))
-        for code in tickers
+        for code in new_codes
     ]
+    DomesticStock.objects.bulk_create(new_stocks)
 
-    # 중복 무시하고 한 번에 저장
-    DomesticStock.objects.bulk_create(domestic_stocks, ignore_conflicts=True)
+    # 상폐된 종목 삭제
+    del_codes = codes_in_db - codes_in_market
+    DomesticStock.objects.filter(product_number__in=del_codes).delete()
 
-    return len(domestic_stocks)
+    return len(new_stocks)
