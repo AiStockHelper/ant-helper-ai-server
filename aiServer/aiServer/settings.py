@@ -45,7 +45,6 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'drf_yasg',
     'rest_framework',
-    'stock',
     'domesticStock',
     'overseasStock',
     'django_apscheduler',
