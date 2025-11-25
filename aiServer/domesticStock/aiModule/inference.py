@@ -3,7 +3,7 @@ from .data_loader import load_ohlcv_1year
 from .feature_engineering import add_indicators
 from .model_utils import load_saved_model
 
-def predict_tomorrow(ticker: str):
+def predict_tomorrow(ticker: str) -> (float, float):
     model, scaler = load_saved_model()
 
     df = load_ohlcv_1year(ticker)
@@ -39,4 +39,9 @@ def predict_tomorrow(ticker: str):
     dummy[0][close_idx] = pred_scaled
     unscaled = scaler.inverse_transform(dummy)[0][close_idx]
 
-    return float(unscaled)
+    # 오늘 마감가
+    today_close = float(df["Close"].iloc[-1])
+    # 내일 예측가
+    predicted_price = float(unscaled)
+
+    return predicted_price, today_close
