@@ -2,6 +2,7 @@ from datetime import date, timedelta
 from typing import List
 
 import pandas as pd
+from holidayskr import is_holiday
 from pykrx import stock
 
 from .aiModule.data_loader import load_ohlcv_1year
@@ -79,10 +80,13 @@ def get_tomorrow_price(product_number: str) -> (float, float):
 
 
 # 국내 모든 주식 주가 예측 및 저장
-def predict_all_tomorrow_price() -> int:
+def predict_all_tomorrow_price():
     stocks = DomesticStock.objects.all()
-    # TODO : 다음 날이 장이 안열리면 안돌아가게 해야 함.
     tomorrow = date.today() + timedelta(days=1)
+
+    # 내일이 휴장일이면 리턴
+    if is_market_open(tomorrow):
+        return
 
     predictions = []
 
@@ -110,4 +114,9 @@ def predict_all_tomorrow_price() -> int:
 
     DomesticStockPredictedPrice.objects.bulk_create(predictions)
 
-    return len(predictions)
+    return
+
+
+# 휴장일 체크
+def is_market_open(d: date) -> bool:
+    return is_holiday(str(d))
