@@ -4,6 +4,10 @@ from keras.layers import GRU
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 
+# 플리커넥티드레이어
+# 복잡하게?
+# 로스?
+# 트랜스포터
 
 # def create_model(input_shape):
 #     model = Sequential([
