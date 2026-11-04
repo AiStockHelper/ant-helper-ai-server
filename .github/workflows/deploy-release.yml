@@ -1,4 +1,4 @@
-name: Deploy AI servers (release → ECR → EC2)
+name: Deploy prediction server (release → ECR → EC2)
 
 on:
   push:
@@ -13,6 +13,9 @@ concurrency:
 
 permissions:
   contents: read
+
+env:
+  ECR_REPOSITORY: ant-helper-ai-prediction
 
 jobs:
   test:
@@ -34,19 +37,9 @@ jobs:
       - run: python -m pytest
 
   image:
-    name: Build & push (${{ matrix.service }})
+    name: Build & push
     needs: test
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - service: django
-            context: aiServer
-            repository: ant-helper-ai-django
-          - service: prediction
-            context: prediction
-            repository: ant-helper-ai-prediction
     steps:
       - uses: actions/checkout@v4
 
@@ -67,8 +60,6 @@ jobs:
 
       - name: Ensure ECR repository
         if: github.event_name != 'pull_request'
-        env:
-          ECR_REPOSITORY: ${{ matrix.repository }}
         run: |
           if ! aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" >/dev/null 2>&1; then
             aws ecr create-repository --repository-name "$ECR_REPOSITORY" \
@@ -82,44 +73,31 @@ jobs:
       - name: Build (and push on release)
         uses: docker/build-push-action@v6
         with:
-          context: ${{ matrix.context }}
+          context: prediction
           push: ${{ github.event_name != 'pull_request' }}
           tags: |
-            ${{ github.event_name == 'pull_request' && format('{0}:ci', matrix.repository) || format('{0}/{1}:{2}', steps.ecr.outputs.registry, matrix.repository, github.sha) }}
-            ${{ github.event_name == 'pull_request' && format('{0}:ci-latest', matrix.repository) || format('{0}/{1}:latest', steps.ecr.outputs.registry, matrix.repository) }}
-          cache-from: type=gha,scope=${{ matrix.service }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+            ${{ github.event_name == 'pull_request' && format('{0}:ci', env.ECR_REPOSITORY) || format('{0}/{1}:{2}', steps.ecr.outputs.registry, env.ECR_REPOSITORY, github.sha) }}
+            ${{ github.event_name == 'pull_request' && format('{0}:ci-latest', env.ECR_REPOSITORY) || format('{0}/{1}:latest', steps.ecr.outputs.registry, env.ECR_REPOSITORY) }}
+          cache-from: type=gha,scope=prediction
+          cache-to: type=gha,mode=max,scope=prediction
 
   deploy:
-    name: Deploy ${{ matrix.service }} to EC2
+    name: Deploy to EC2
     needs: image
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    strategy:
-      max-parallel: 1
-      fail-fast: false
-      matrix:
-        include:
-          - service: prediction
-            repository: ant-helper-ai-prediction
-          - service: django
-            repository: ant-helper-ai-django
     env:
       EC2_HOST: ${{ secrets.EC2_HOST }}
       EC2_USER: ${{ secrets.EC2_USER }}
       EC2_KEY: ${{ secrets.EC2_KEY }}
-      DJANGO_SECRETS_JSON: ${{ secrets.SECRETS }}
-      DJANGO_MY_SETTINGS_PY: ${{ secrets.DB_SETTINGS }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Check required secrets
         run: |
-          required="EC2_HOST EC2_USER EC2_KEY"
-          if [ "${{ matrix.service }}" = "django" ]; then required="$required DJANGO_SECRETS_JSON DJANGO_MY_SETTINGS_PY"; fi
           missing=0
-          for name in $required; do
-            if [ -z "${!name}" ]; then echo "::error::required GitHub secret for '$name' is not set (django: SECRETS / DB_SETTINGS)"; missing=1; fi
+          for name in EC2_HOST EC2_USER EC2_KEY; do
+            if [ -z "${!name}" ]; then echo "::error::required GitHub secret for '$name' is not set"; missing=1; fi
           done
           exit $missing
 
@@ -141,17 +119,6 @@ jobs:
           chmod 600 ~/.ssh/ec2_key
           ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
 
-      # secrets.json / my_settings.py 는 이미지에 넣지 않고 EC2 로 올려 컨테이너에 마운트한다.
-      - name: Upload Django runtime config (from secrets)
-        if: matrix.service == 'django'
-        run: |
-          mkdir -p cfg
-          printf '%s\n' "$DJANGO_SECRETS_JSON" > cfg/secrets.json
-          printf '%s\n' "$DJANGO_MY_SETTINGS_PY" > cfg/my_settings.py
-          chmod 600 cfg/*
-          ssh -i ~/.ssh/ec2_key "$EC2_USER@$EC2_HOST" 'mkdir -p ~/ant-helper/incoming/django-config'
-          scp -i ~/.ssh/ec2_key cfg/secrets.json cfg/my_settings.py "$EC2_USER@$EC2_HOST:ant-helper/incoming/django-config/"
-
       - name: Docker login on EC2 (ECR)
         env:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
@@ -162,9 +129,8 @@ jobs:
 
       - name: Switch container & health check
         env:
-          SERVICE: ${{ matrix.service }}
-          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ matrix.repository }}:${{ github.sha }}
-        run: ssh -i ~/.ssh/ec2_key "$EC2_USER@$EC2_HOST" "SERVICE=$SERVICE IMAGE=$IMAGE bash -s" < .github/scripts/remote-deploy.sh
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+        run: ssh -i ~/.ssh/ec2_key "$EC2_USER@$EC2_HOST" "IMAGE=$IMAGE bash -s" < .github/scripts/remote-deploy.sh
 
       - name: Cleanup SSH key
         if: always()
