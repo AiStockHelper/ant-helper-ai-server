@@ -1,4 +1,4 @@
-name: Deploy prediction server (release → ECR → EC2)
+name: Deploy prediction server (release → EC2)
 
 on:
   push:
@@ -8,14 +8,11 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: deploy-release
+  group: deploy-prediction
   cancel-in-progress: false
 
 permissions:
   contents: read
-
-env:
-  ECR_REPOSITORY: ant-helper-ai-prediction
 
 jobs:
   test:
@@ -36,102 +33,67 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python -m pytest
 
-  image:
-    name: Build & push
-    needs: test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Configure AWS credentials
-        if: github.event_name != 'pull_request'
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
-
-      - name: Login to ECR
-        if: github.event_name != 'pull_request'
-        id: ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Ensure ECR repository
-        if: github.event_name != 'pull_request'
-        run: |
-          if ! aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" >/dev/null 2>&1; then
-            aws ecr create-repository --repository-name "$ECR_REPOSITORY" \
-              --image-scanning-configuration scanOnPush=true >/dev/null
-            aws ecr put-lifecycle-policy --repository-name "$ECR_REPOSITORY" --lifecycle-policy-text '{
-              "rules":[{"rulePriority":1,"description":"keep last 10 images",
-                "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},
-                "action":{"type":"expire"}}]}' >/dev/null || echo "::warning::could not set ECR lifecycle policy"
-          fi
-
-      - name: Build (and push on release)
-        uses: docker/build-push-action@v6
-        with:
-          context: prediction
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: |
-            ${{ github.event_name == 'pull_request' && format('{0}:ci', env.ECR_REPOSITORY) || format('{0}/{1}:{2}', steps.ecr.outputs.registry, env.ECR_REPOSITORY, github.sha) }}
-            ${{ github.event_name == 'pull_request' && format('{0}:ci-latest', env.ECR_REPOSITORY) || format('{0}/{1}:latest', steps.ecr.outputs.registry, env.ECR_REPOSITORY) }}
-          cache-from: type=gha,scope=prediction
-          cache-to: type=gha,mode=max,scope=prediction
-
   deploy:
     name: Deploy to EC2
-    needs: image
+    needs: test
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      id-token: write
+      contents: read
     env:
-      EC2_HOST: ${{ secrets.EC2_HOST }}
-      EC2_USER: ${{ secrets.EC2_USER }}
+      EC2_HOST: ${{ vars.EC2_HOST }}
+      EC2_USER: ${{ vars.EC2_USER }}
+      EC2_SG_ID: ${{ vars.EC2_SG_ID }}
+      EC2_HOST_KEY: ${{ vars.EC2_HOST_KEY }}
       EC2_KEY: ${{ secrets.EC2_KEY }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check required secrets
-        run: |
-          missing=0
-          for name in EC2_HOST EC2_USER EC2_KEY; do
-            if [ -z "${!name}" ]; then echo "::error::required GitHub secret for '$name' is not set"; missing=1; fi
-          done
-          exit $missing
-
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
-
-      - name: Resolve ECR registry
-        id: ecr
-        uses: aws-actions/amazon-ecr-login@v2
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
 
       - name: Prepare SSH
         run: |
           install -m 700 -d ~/.ssh
           printf '%s\n' "$EC2_KEY" > ~/.ssh/ec2_key
           chmod 600 ~/.ssh/ec2_key
-          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+          printf '%s %s\n' "$EC2_HOST" "$EC2_HOST_KEY" > ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host ec2
+            HostName $EC2_HOST
+            User $EC2_USER
+            IdentityFile ~/.ssh/ec2_key
+            IdentitiesOnly yes
+            ConnectTimeout 20
+            ServerAliveInterval 15
+            ServerAliveCountMax 12
+          EOF
+          chmod 600 ~/.ssh/config
 
-      - name: Docker login on EC2 (ECR)
-        env:
-          REGISTRY: ${{ steps.ecr.outputs.registry }}
+      # 보안그룹의 22번 포트는 고정 IP 에만 열려 있다. 이 러너의 IP 만 배포 동안 열고 항상 닫는다.
+      - name: Open SSH for this runner
+        id: sg
         run: |
-          aws ecr get-login-password | ssh -i ~/.ssh/ec2_key "$EC2_USER@$EC2_HOST" \
-            "command -v docker >/dev/null || { sudo apt-get update -y && sudo apt-get install -y docker.io curl && sudo systemctl enable --now docker; }; \
-             sudo docker login --username AWS --password-stdin $REGISTRY"
+          ip="$(curl -fsS https://checkip.amazonaws.com | tr -d '[:space:]')"
+          echo "ip=$ip" >> "$GITHUB_OUTPUT"
+          if ! out="$(aws ec2 authorize-security-group-ingress --group-id "$EC2_SG_ID" \
+              --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=${ip}/32,Description=gha-${GITHUB_REPOSITORY#*/}-${GITHUB_RUN_ID}}]" 2>&1)"; then
+            echo "$out"; grep -q 'InvalidPermission.Duplicate' <<< "$out" || exit 1
+          fi
+          for i in $(seq 1 12); do ssh ec2 true && exit 0; sleep 5; done
+          echo "::error::cannot reach EC2 over SSH"; exit 1
 
-      - name: Switch container & health check
-        env:
-          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
-        run: ssh -i ~/.ssh/ec2_key "$EC2_USER@$EC2_HOST" "IMAGE=$IMAGE bash -s" < .github/scripts/remote-deploy.sh
+      - name: Check out commit on server, install deps, restart & health check
+        run: ssh ec2 "SHA=${GITHUB_SHA} bash -s" < .github/scripts/remote-deploy.sh
 
-      - name: Cleanup SSH key
-        if: always()
-        run: rm -f ~/.ssh/ec2_key
+      - name: Close SSH for this runner
+        if: always() && steps.sg.outputs.ip != ''
+        run: |
+          aws ec2 revoke-security-group-ingress --group-id "$EC2_SG_ID" \
+            --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=${{ steps.sg.outputs.ip }}/32}]" >/dev/null || true
+          rm -f ~/.ssh/ec2_key
