@@ -3,13 +3,17 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from . import batch
 from .indicators import InsufficientDataError, prepare_frame
 from .predictor import predict_frame
 from .schemas import (
+    BatchResult,
+    BatchStartRequest,
+    BatchStatus,
     HealthResponse,
     PredictRequest,
     PredictResult,
@@ -53,3 +57,42 @@ def predict(req: PredictRequest) -> PredictResult:
 @app.post("/v1/screen", response_model=ScreenResponse, response_model_by_alias=True)
 def screen(req: ScreenRequest) -> ScreenResponse:
     return ScreenResponse(ranked=screen_items(req.items, req.top_n, req.min_score))
+
+
+def _status(job: batch.Job) -> BatchStatus:
+    return BatchStatus(
+        job_id=job.id, market=job.market, status=job.status, phase=job.phase, done=job.done, total=job.total,
+        count=len(job.items), trade_date=job.trade_date, error=job.error,
+    )
+
+
+@app.post("/v1/batch/screen", response_model=BatchStatus, response_model_by_alias=True)
+def batch_start(req: BatchStartRequest) -> BatchStatus:
+    """종목 목록의 일봉을 수집·저장하고 유동성 상위 종목을 전부 스코어링하는 작업을 시작한다(비동기)."""
+    try:
+        job = batch.start_job(
+            req.market,
+            [{"symbol": s.symbol, "name": s.name, "market": s.market} for s in req.symbols],
+            req.top_liquid, req.min_trade_value, req.min_price,
+        )
+    except batch.JobBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _status(job)
+
+
+@app.get("/v1/batch/{job_id}", response_model=BatchStatus, response_model_by_alias=True)
+def batch_status(job_id: str) -> BatchStatus:
+    job = batch.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
+    return _status(job)
+
+
+@app.get("/v1/batch/{job_id}/result", response_model=BatchResult, response_model_by_alias=True)
+def batch_result(job_id: str) -> BatchResult:
+    job = batch.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
+    if job.status != "DONE":
+        raise HTTPException(status_code=409, detail=f"작업이 아직 끝나지 않았습니다({job.status}).")
+    return BatchResult(status=_status(job), items=job.items)
