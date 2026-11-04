@@ -1,61 +1,56 @@
 #!/usr/bin/env bash
-# EC2 에서 실행되는 배포 스크립트 (GitHub Actions 가 ssh 로 stdin 에 흘려 넣는다).
-# 필수 환경변수: IMAGE (ECR 이미지 URI)
-# ECR 로그인은 워크플로우가 먼저 해 둔다. 새 컨테이너가 헬스 체크를 통과하지 못하면 이전 이미지로 되돌린다.
+# EC2 에서 실행되는 prediction 서버 배포 스크립트 (GitHub Actions 가 ssh 로 stdin 에 흘려 넣는다).
+# 필수 환경변수: SHA (배포할 커밋)
+# 서버 구성: systemd 서비스 ant-prediction (uvicorn, 127.0.0.1:8000),
+#   코드 = /opt/antlab/ant-prediction/repo (이 레포의 clone, 앱은 repo/prediction), venv = /opt/antlab/ant-prediction/venv
+# 헬스 체크에 실패하면 직전 커밋으로 되돌린다. repo/prediction/data (예측 캐시)는 추적 대상이 아니라 유지된다.
 set -euo pipefail
 
-: "${IMAGE:?IMAGE is required}"
+: "${SHA:?SHA is required}"
 
-NAME=ant-helper-ai-prediction
-HEALTH_URL="http://localhost:8001/health"
-MAX_WAIT_STEPS=24
-D="sudo docker"
+BASE=/opt/antlab/ant-prediction
+REPO="$BASE/repo"
+VENV="$BASE/venv"
+SERVICE=ant-prediction
+HEALTH_URL="http://127.0.0.1:8000/health"
 
-if ! command -v docker >/dev/null 2>&1; then
-  echo ">> installing docker"
-  sudo apt-get update -y
-  sudo apt-get install -y docker.io curl
-  sudo systemctl enable --now docker
+cd "$REPO"
+PREV="$(git rev-parse HEAD)"
+echo ">> current $PREV -> target $SHA"
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+  echo "!! server clone has local modifications (will be discarded):"; git status --short --untracked-files=no
 fi
-
-run_container() {
-  # host 네트워크: 백엔드가 localhost:8001 로 호출한다.
-  $D run -d --name "$NAME" --restart unless-stopped --network host "$1" >/dev/null
-}
 
 wait_healthy() {
   local i code
-  for i in $(seq 1 "$MAX_WAIT_STEPS"); do
-    code="$(curl -s -o /dev/null -w '%{http_code}' "$HEALTH_URL" || true)"
-    if [ "$code" != "000" ] && [ "$code" -lt 500 ]; then
-      echo ">> healthy (HTTP $code) after $((i * 5))s"
-      return 0
-    fi
+  for i in $(seq 1 36); do
+    code="$(curl -s -m 10 -o /dev/null -w '%{http_code}' "$HEALTH_URL" || true)"
+    if [ "$code" = "200" ]; then echo ">> healthy after ~$((i * 5))s"; return 0; fi
     sleep 5
   done
   return 1
 }
 
-PREV_IMAGE="$($D inspect -f '{{.Config.Image}}' "$NAME" 2>/dev/null || true)"
+install_deps() {
+  # 메모리가 빠듯한 서버라 우선순위를 낮춰 설치한다. 서비스는 설치가 끝난 뒤에 재시작한다.
+  nice -n 10 "$VENV/bin/pip" install --quiet --disable-pip-version-check --no-cache-dir -r "$REPO/prediction/requirements.txt"
+}
 
-echo ">> pulling $IMAGE"
-$D pull "$IMAGE"
+git fetch --quiet origin "$SHA" || git fetch --quiet origin release
+git checkout --quiet -f --detach "$SHA"
+echo ">> now at $(git log -1 --format='%h %s')"
 
-$D rm -f "$NAME" >/dev/null 2>&1 || true
-echo ">> starting $IMAGE"
-run_container "$IMAGE"
+install_deps
+sudo systemctl restart "$SERVICE"
 
-if wait_healthy; then
-  $D image prune -af --filter "until=168h" >/dev/null 2>&1 || true
-  exit 0
-fi
+if wait_healthy; then exit 0; fi
 
-echo "!! health check failed ($HEALTH_URL). recent logs:"
-$D logs --tail 80 "$NAME" || true
+echo "!! health check failed. recent logs:"
+sudo journalctl -u "$SERVICE" -n 60 --no-pager | cut -c1-220 || true
 
-if [ -n "$PREV_IMAGE" ] && [ "$PREV_IMAGE" != "$IMAGE" ]; then
-  echo "!! rolling back to $PREV_IMAGE"
-  $D rm -f "$NAME" >/dev/null 2>&1 || true
-  run_container "$PREV_IMAGE"
-fi
+echo "!! rolling back to $PREV"
+git checkout --quiet -f --detach "$PREV"
+install_deps || true
+sudo systemctl restart "$SERVICE"
+if wait_healthy; then echo ">> rollback OK"; else echo "!! rollback ALSO unhealthy - manual check needed"; fi
 exit 1
