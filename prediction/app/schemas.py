@@ -86,3 +86,55 @@ class ScreenResponse(CamelModel):
 
 class HealthResponse(CamelModel):
     status: str = "UP"
+
+
+# ───────────────────────── 야간 배치 ─────────────────────────
+
+Market = Literal["KRX", "US"]
+MAX_BATCH_SYMBOLS = 20000
+
+
+class BatchSymbol(CamelModel):
+    symbol: str = Field(min_length=1, max_length=20)
+    name: Optional[str] = None
+    market: Optional[str] = None  # 거래소 구분(NASDAQ/NYSE/AMEX 등). 결과에 그대로 되돌려 준다.
+
+
+class BatchStartRequest(CamelModel):
+    market: Market
+    symbols: List[BatchSymbol] = Field(min_length=1, max_length=MAX_BATCH_SYMBOLS)
+    top_liquid: int = Field(default=1000, ge=10, le=5000)
+    min_trade_value: Optional[float] = Field(default=None, ge=0)
+    min_price: Optional[float] = Field(default=None, ge=0)
+
+
+class BatchStatus(CamelModel):
+    job_id: str
+    market: Market
+    status: Literal["RUNNING", "DONE", "FAILED"]
+    phase: str
+    done: int
+    total: int
+    count: int = 0
+    trade_date: Optional[str] = None
+    error: Optional[str] = None
+
+
+class BatchItem(CamelModel):
+    symbol: str
+    name: str
+    market: Optional[str] = None
+    currency: Currency
+    trade_date: str
+    current_price: float
+    score: float
+    predicted_change_rate: float
+    direction: Direction
+    confidence: float
+    reasons: List[str]
+    avg_trade_value: float
+
+
+class BatchResult(CamelModel):
+    status: BatchStatus
+    items: List[BatchItem]
