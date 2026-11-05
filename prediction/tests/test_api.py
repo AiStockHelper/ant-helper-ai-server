@@ -192,3 +192,17 @@ def test_screen_missing_items_422(client):
     r = client.post("/v1/screen", json={})
     assert r.status_code == 422
     assert isinstance(r.json()["detail"], str)
+
+
+def test_internal_key_is_enforced_when_configured(client, monkeypatch):
+    monkeypatch.setenv("INTERNAL_API_KEY", "s3cret")
+    assert client.get("/health").status_code == 200  # 헬스 체크는 열려 있다
+    assert client.post("/v1/screen", json={"items": []}).status_code == 401
+    assert client.post("/v1/screen", json={"items": []}, headers={"X-Internal-Key": "wrong"}).status_code == 401
+    ok = client.post("/v1/screen", json={"items": []}, headers={"X-Internal-Key": "s3cret"})
+    assert ok.status_code != 401
+
+
+def test_internal_key_not_required_when_unset(client, monkeypatch):
+    monkeypatch.delenv("INTERNAL_API_KEY", raising=False)
+    assert client.post("/v1/screen", json={"items": []}).status_code != 401
