@@ -1,7 +1,9 @@
 """예측 서버: 캔들을 받아 예측/스코어링만 수행한다 (KIS·DB·계정 정보 없음)."""
 from __future__ import annotations
 
+import hmac
 import logging
+import os
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -25,6 +27,17 @@ from .screener import screen_items
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Ant Helper Prediction Server", version="1.0.0")
+
+
+@app.middleware("http")
+async def require_internal_key(request: Request, call_next):
+    """INTERNAL_API_KEY 환경변수가 있으면 백엔드와 공유한 X-Internal-Key 헤더가 맞아야 한다(/health 제외)."""
+    expected = os.environ.get("INTERNAL_API_KEY", "").strip()
+    if expected and request.url.path != "/health":
+        given = request.headers.get("x-internal-key", "")
+        if not hmac.compare_digest(given.encode(), expected.encode()):
+            return JSONResponse(status_code=401, content={"detail": "unauthorized"})
+    return await call_next(request)
 
 
 @app.exception_handler(InsufficientDataError)
