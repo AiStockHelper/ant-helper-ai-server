@@ -133,6 +133,7 @@ class BatchItem(CamelModel):
     confidence: float
     reasons: List[str]
     avg_trade_value: float
+    facts: Dict[str, float] = Field(default_factory=dict)  # 순위에 쓴 사실들(수익률·변동성·RSI 등). AI 가 모델 점수 없이 직접 판단할 때도 쓴다.
 
 
 class BatchResult(CamelModel):
