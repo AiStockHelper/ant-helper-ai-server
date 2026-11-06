@@ -185,4 +185,7 @@ def fetch_us(symbols: Sequence[str], last_dates: Dict[str, str], progress: Optio
 
 
 def fetch(market: str, symbols: Sequence[str], last_dates: Dict[str, str], progress: Optional[Progress] = None) -> List[Row]:
+    if os.environ.get("PREDICTION_OFFLINE") == "1":
+        # 개발용: 새로 내려받지 않고 이미 저장된 일봉만으로 분석한다(외부 사이트가 느리거나 막혔을 때).
+        return []
     return fetch_krx(symbols, last_dates, progress) if market == "KRX" else fetch_us(symbols, last_dates, progress)

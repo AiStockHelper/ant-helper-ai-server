@@ -17,9 +17,9 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import marketdata
 from .currency import DEFAULT_CURRENCY
+from . import factors
 from .indicators import InsufficientDataError, prepare_frame
-from .predictor import predict_frame
-from .screener import score_prediction
+from .screener import analyze_frame
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +128,7 @@ def _run(job: Job, symbols: List[Dict[str, Optional[str]]], top_liquid: int, min
         for r in results:
             r["market"] = meta[r["symbol"]].get("market")
             r["avgTradeValue"] = trade_value[r["symbol"]]
+        factors.apply_ranking(results, factors.RANK_UNIVERSE)
         results.sort(key=lambda r: r["score"], reverse=True)
         job.items = results
         job.phase = "완료"
@@ -171,13 +172,9 @@ def screen_one(task: Tuple[str, str, str, List[Candle6]]) -> Optional[Dict[str, 
     try:
         candles = [SimpleNamespace(date=b[0], open=b[1], high=b[2], low=b[3], close=b[4], volume=b[5]) for b in bars]
         df = prepare_frame(candles)
-        pred = predict_frame(df, symbol, name, currency or DEFAULT_CURRENCY)
-        score, reasons = score_prediction(pred)
-        return {
-            "symbol": symbol, "name": pred.name, "currency": pred.currency, "tradeDate": bars[-1][0],
-            "currentPrice": pred.current_price, "score": score, "predictedChangeRate": pred.predicted_change_rate,
-            "direction": pred.direction, "confidence": pred.confidence, "reasons": reasons,
-        }
+        rec = analyze_frame(df, symbol, name, currency or DEFAULT_CURRENCY)
+        rec["tradeDate"] = bars[-1][0]
+        return rec
     except InsufficientDataError:
         return None
     except Exception as exc:  # noqa: BLE001
