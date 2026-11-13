@@ -112,7 +112,7 @@ def build_features(o, h, l, c, v) -> np.ndarray:
     feats.append((H - L) / C)
     feats.append(O / C.shift(1) - 1)
     feats.append((C - L) / (H - L).replace(0, np.nan))
-    return np.stack([f.to_numpy(dtype=float) for f in feats], axis=-1)
+    return np.stack([f.to_numpy(dtype=np.float32) for f in feats], axis=-1)    # 3천 종목 × 12년이라 float32 로 메모리를 아낀다
 
 
 def next_day_return(c: np.ndarray) -> np.ndarray:
@@ -214,6 +214,8 @@ class Result:
     exits_take_profit: int = 0
     exits_stop: int = 0
     exits_expire: int = 0
+    exits_regime: int = 0
+    exits_delist: int = 0
     avg_trade_net: float = float("nan")
     closed_pnl: float = 0.0
     closed_cost: float = 0.0
@@ -224,8 +226,13 @@ class Result:
 def simulate(dates: pd.DatetimeIndex, o, h, l, c, picks: Dict[int, np.ndarray], first_day: int, capital: float, costs: Costs,
              take_profit: float = 0.02, stop: Optional[float] = None, max_hold: Optional[int] = None, same_day_exit: bool = False,
              skip_held: bool = False, alloc: str = "shares", max_positions: int = 20, same_bar: str = "stop",
-             adv: Optional[np.ndarray] = None, adv_cap: float = 0.0) -> Result:
+             adv: Optional[np.ndarray] = None, adv_cap: float = 0.0, risk_off: Optional[np.ndarray] = None,
+             delist_recovery: Optional[float] = None) -> Result:
+    """risk_off[t] 가 True 면 t 일 종가 후 '급락기'로 판단한 것이다: t+1 시가에 보유 종목을 모두 팔고(시장가, 슬리피지 반영) 신규 매수를 멈춘다.
+    delist_recovery 가 있으면 데이터가 끝난(상장폐지) 종목을 들고 있을 때 마지막 종가 × 그 비율로 정리한다(None 이면 마지막 종가로 계속 평가)."""
     D, S = c.shape
+    valid_c = np.isfinite(c)
+    last_idx = np.where(valid_c.any(axis=0), D - 1 - np.argmax(valid_c[::-1], axis=0), -1)     # 종목별 마지막 시세가 있는 날
     shares = np.zeros(S)
     paid = np.zeros(S)           # 매수 체결가 합(수수료 제외)
     age = np.zeros(S, dtype=int)
@@ -238,7 +245,7 @@ def simulate(dates: pd.DatetimeIndex, o, h, l, c, picks: Dict[int, np.ndarray], 
     closed_net: List[float] = []
     pnl_sum = 0.0
     cost_sum = 0.0
-    exit_counts = {1: 0, 2: 0, 3: 0}
+    exit_counts = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
     comm, tax, slip = costs.commission, costs.sell_tax, costs.slippage
     rng = np.random.default_rng(12345)
 
@@ -246,6 +253,9 @@ def simulate(dates: pd.DatetimeIndex, o, h, l, c, picks: Dict[int, np.ndarray], 
         bought_today = np.zeros(S, dtype=bool)
         # 1) 전일 종가 신호 → 오늘 시가에 매수: 싼 종목부터 1주씩, 돈이 남으면 다시 싼 종목부터
         idx = picks.get(d - 1)
+        regime_off = risk_off is not None and bool(risk_off[d - 1])
+        if regime_off:
+            idx = None                           # 급락기 판단 중에는 새로 사지 않는다
         if idx is not None and skip_held:
             idx = idx[shares[idx] == 0]          # 이미 들고 있는 종목은 더 사지 않는다(매수별 보유 기간이 어긋나지 않게)
         if alloc == "equal" and idx is not None and len(idx):
@@ -319,6 +329,14 @@ def simulate(dates: pd.DatetimeIndex, o, h, l, c, picks: Dict[int, np.ndarray], 
                 expire = can & (reason == 0) & (age >= max_hold) & np.isfinite(c[d])
                 fill = np.where(expire, c[d] * (1 - slip), fill)
                 reason = np.where(expire, 3, reason)
+            if regime_off:
+                to_cash = held & np.isfinite(o[d]) & (o[d] > 0)
+                fill = np.where(to_cash, o[d] * (1 - slip), fill)
+                reason = np.where(to_cash, 4, reason)
+            if delist_recovery is not None:
+                gone = held & ~np.isfinite(c[d]) & (d > last_idx)
+                fill = np.where(gone, last * delist_recovery, fill)
+                reason = np.where(gone, 5, reason)
             sold = reason > 0
             if sold.any():
                 proceeds = shares[sold] * fill[sold] * (1 - comm - tax)
@@ -357,6 +375,7 @@ def simulate(dates: pd.DatetimeIndex, o, h, l, c, picks: Dict[int, np.ndarray], 
         avg_invested_share=float(np.mean(invested_share)) if invested_share else 0.0,
         final_net=final_net,
         exits_take_profit=exit_counts[1], exits_stop=exit_counts[2], exits_expire=exit_counts[3],
+        exits_regime=exit_counts[4], exits_delist=exit_counts[5],
         avg_trade_net=float(np.mean(closed_net)) if closed_net else float("nan"),
         closed_pnl=pnl_sum, closed_cost=cost_sum, final_cash=cash, open_cost=float((paid * (1 + comm)).sum()),
     )
@@ -386,6 +405,8 @@ def stats(r: Result, first_day: int, capital: float) -> dict:
         "익절%": r.exits_take_profit / max(1, r.trades_closed) * 100,
         "손절%": r.exits_stop / max(1, r.trades_closed) * 100,
         "만료%": r.exits_expire / max(1, r.trades_closed) * 100,
+        "급락정리%": r.exits_regime / max(1, r.trades_closed) * 100,
+        "폐지정리건수": r.exits_delist,
     }
 
 
@@ -496,9 +517,114 @@ def custom_report(a, dates, o, h, l, c, v, first, test, ml_picks) -> None:
     print(f"\n저장: {out}")
 
 
+def regime_signal(series: np.ndarray, rule: str) -> np.ndarray:
+    """T 일 종가까지의 지수만으로 만든 '급락기' 판단(True=현금). 미래 정보를 쓰지 않는다."""
+    s = pd.Series(series)
+    if rule == "ma20":
+        off = s < s.rolling(20, min_periods=20).mean()
+    elif rule == "ma60":
+        off = s < s.rolling(60, min_periods=60).mean()
+    elif rule == "dd7":
+        off = s / s.rolling(20, min_periods=20).max() - 1 <= -0.07
+    elif rule == "ret5":
+        off = s.pct_change(5, fill_method=None) <= -0.05
+    else:
+        raise ValueError(rule)
+    return off.fillna(False).to_numpy(dtype=bool)
+
+
+def load_status(db: str) -> Dict[str, str]:
+    try:
+        con = sqlite3.connect(f"file:{DATA / db}?mode=ro", uri=True)
+        rows = con.execute("select symbol, status from meta").fetchall()
+        con.close()
+        return {s: st for s, st in rows}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def regime_report(a, dates, o, h, l, c, v, first, test, ml, syms) -> None:
+    """상장폐지 종목을 포함한 전종목 데이터에서, 급락기를 '그날까지의 지수 흐름'으로 판단해 현금으로 피하는 효과를 본다."""
+    cost = Costs()
+    adv = pd.DataFrame(c * v).rolling(20, min_periods=15).mean().to_numpy()
+    status = load_status("candles_krx_all.sqlite")
+    delisted = np.array([status.get(s) == "DELISTED" for s in syms])
+    D = len(dates)
+
+    rets = c[1:] / c[:-1] - 1
+    ew_daily = np.nanmean(np.where(np.isfinite(rets), rets, np.nan), axis=1)
+    ew_series_all = pd.Series(np.concatenate([[0.0], np.nan_to_num(ew_daily)]), index=dates)
+    ew_idx = (1 + ew_series_all).cumprod().to_numpy()
+    kospi = load_index("^KS11", "2013-06-01")
+    indexes = {"전종목 동일비중": ew_idx}
+    if kospi is not None and len(kospi) > 100:
+        indexes = {"코스피": kospi.reindex(dates).ffill().to_numpy(), **indexes}
+    rules = {"ma20": "20일선 아래", "ma60": "60일선 아래", "dd7": "20일 고점 -7%", "ret5": "5일 -5% 급락"}
+
+    print(f"\n상장폐지 종목 {int(delisted.sum()):,}개 포함(전체 {len(syms):,}개). 시험 기간 중 시세가 끝난 종목 수: "
+          f"{int(sum(1 for k in range(len(syms)) if delisted[k] and np.isfinite(c[first:, k]).any())):,}")
+
+    offs: Dict[Tuple[str, str], np.ndarray] = {(iname, rk): regime_signal(iv, rk) for iname, iv in indexes.items() for rk in rules}
+    print("\n== 급락기 판단 비중(시험 기간 중 현금으로 쉬는 날의 비율 %)")
+    print(pd.DataFrame({iname: {rules[rk]: float(offs[(iname, rk)][first:].mean() * 100) for rk in rules} for iname in indexes}).round(1).to_string())
+
+    def run(picks, stop, off=None, rec=1.0, costs=cost, tp=a.threshold):
+        return simulate(dates, o, h, l, c, picks, first, a.capital, costs, take_profit=tp, stop=stop, max_hold=a.max_hold, skip_held=True,
+                        alloc="equal", max_positions=a.max_positions, same_bar=a.same_bar, adv=adv, adv_cap=a.adv_cap, risk_off=off, delist_recovery=rec)
+
+    def median_run(make, stop, off=None):
+        res = [run(make(s), stop, off) for s in range(a.seeds)]
+        mid = float(np.median([x.final_net for x in res]))
+        return min(res, key=lambda r: abs(r.final_net - mid))
+
+    cols = ["최종자산(만원)", "총수익률%", "연환산%", "최대낙폭%", "승률%", "평균투자비중%", "매도건수", "급락정리%", "폐지정리건수"]
+    pd.set_option("display.width", 250)
+    pd.set_option("display.max_columns", 40)
+    pd.set_option("display.max_colwidth", 60)
+    all_rows: Dict[str, Result] = {}
+    for tag, stop in (("손절 -%d%%" % round(a.stop * 100), a.stop), ("손절 없음", None)):
+        rows: Dict[str, Result] = {"필터 없음": run(ml, stop)}
+        for iname in indexes:
+            for rk, rname in rules.items():
+                rows[f"{iname} {rname}"] = run(ml, stop, offs[(iname, rk)])
+        rows["[비교] 무작위 선정 · 필터 없음"] = median_run(lambda s: random_picks(c, v, test, a.q, 600 + s), stop)
+        best_iname = list(indexes)[0]
+        rows[f"[비교] 무작위 선정 · {best_iname} 60일선"] = median_run(lambda s: random_picks(c, v, test, a.q, 600 + s), stop, offs[(best_iname, "ma60")])
+        surv = {d: idx[~delisted[idx]] for d, idx in ml.items()}
+        rows["[비교] 상장폐지 종목 제외(생존자만) · 필터 없음"] = run(surv, stop)
+        rows[f"[비교] 상장폐지 제외 · {best_iname} 60일선"] = run(surv, stop, offs[(best_iname, "ma60")])
+        for nm, r in rows.items():
+            all_rows[f"{tag} | {nm}"] = r
+        table = pd.DataFrame({k: stats(r, first, a.capital) for k, r in rows.items()}).T
+        print(f"\n== ML 예측 · 익절 +{a.threshold:.0%} · {tag} · {a.max_hold}영업일 후 정리 · 균등 {a.max_positions}종목 · 비용 반영 · 상장폐지 포함({a.capital:,.0f}원)")
+        print(table[cols].round(1).to_string())
+
+    print("\n== 상장폐지 종목을 들고 있을 때 회수율 가정(손절 없음 · 필터 없음)")
+    rec_rows = {f"마지막 종가의 {int(rec * 100)}%": stats(run(ml, None, rec=rec), first, a.capital) for rec in (1.0, 0.5, 0.0)}
+    print(pd.DataFrame(rec_rows).T[["총수익률%", "연환산%", "최대낙폭%", "폐지정리건수"]].round(1).to_string())
+
+    pick = [f"{tag} | {nm}" for tag in ("손절 -%d%%" % round(a.stop * 100), "손절 없음") for nm in ("필터 없음", f"{list(indexes)[0]} 60일선 아래", "전종목 동일비중 60일선 아래")]
+    ew_year = ew_series_all.iloc[first:].groupby(ew_series_all.index[first:].year).apply(lambda s: (np.prod(1 + s) - 1) * 100)
+    y = pd.DataFrame({k.replace(" | ", "·"): yearly(all_rows[k], first) for k in pick if k in all_rows}).round(1)
+    y["동일비중 보유"] = ew_year.round(1)
+    if kospi is not None and len(kospi) > 100:
+        ks = kospi[kospi.index >= dates[first] - pd.Timedelta(days=7)]
+        ky = ks.groupby(ks.index.year).last()
+        y["코스피"] = ((ky / ky.shift(1) - 1) * 100).reindex(y.index).round(1)
+    print("\n== 연도별 수익률(%)")
+    print(y.to_string())
+
+    OUT.mkdir(parents=True, exist_ok=True)
+    out = OUT / "donga_backtest_regime.csv"
+    pd.DataFrame({k: stats(r, first, a.capital) for k, r in all_rows.items()}).T.round(4).to_csv(out, encoding="utf-8-sig")
+    print(f"\n저장: {out}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("dataset", choices=["long", "broad"])
+    ap.add_argument("dataset", choices=["long", "broad", "all"])
+    ap.add_argument("--regime", action="store_true", help="급락기 현금 보유 필터를 비교한다(dataset=all 권장: 상장폐지 종목 포함)")
+    ap.add_argument("--reuse-picks", action="store_true", help="저장된 ML 신호(pickle)가 있으면 다시 학습하지 않는다")
     ap.add_argument("--start", default=None, help="시험 시작일(기본: long=2016-01-01, broad=전체의 뒤 40%)")
     ap.add_argument("--q", type=float, default=0.15, help="하루에 고르는 종목 비율(기사: 3000개 중 400~500개 ≈ 15%)")
     ap.add_argument("--capital", type=float, default=30_000_000)
@@ -518,6 +644,9 @@ def main() -> None:
     if a.dataset == "long":
         dates, syms, p = load_panel("candles_max.sqlite", "KRX", "2012-01-01", 600)
         start = a.start or "2016-01-01"
+    elif a.dataset == "all":
+        dates, syms, p = load_panel("candles_krx_all.sqlite", "KRX", "2014-01-01", 120)
+        start = a.start or "2016-01-01"
     else:
         dates, syms, p = load_panel("candles.sqlite", "KRX", "2026-01-01", 60)
         start = a.start
@@ -533,11 +662,24 @@ def main() -> None:
     train_days = min(a.train_days, first - 60)
     log(f"시험 구간: {dates[first].date()} ~ {dates[-1].date()} ({len(test):,}거래일), 학습 {train_days}일 · {a.retrain_every}일마다 재학습, 하루 상위 {a.q:.0%} 선정")
 
-    log("  ML 모델 학습·신호 생성…")
-    ml, diag = walk_forward_picks(feat, c, v, test, a.q, train_days, a.retrain_every, a.threshold, lambda s: None)
+    cache = OUT / f"donga_picks_{a.dataset}_{a.q}_{train_days}.pkl"
+    if a.reuse_picks and cache.exists():
+        import pickle
+        ml, diag = pickle.loads(cache.read_bytes())
+        log(f"  저장된 ML 신호 사용: {cache}")
+    else:
+        log("  ML 모델 학습·신호 생성…")
+        ml, diag = walk_forward_picks(feat, c, v, test, a.q, train_days, a.retrain_every, a.threshold, lambda s: None)
+        import pickle
+        OUT.mkdir(parents=True, exist_ok=True)
+        cache.write_bytes(pickle.dumps((ml, diag)))
+    del feat
     log(f"  신호 {diag['pickDays']}일, 하루 평균 {diag['avgPicksPerDay']:.0f}종목 | 고른 종목의 다음날 상승률(적중) {diag['pickUpRate']:.1%} | "
         f"다음날 +{a.threshold:.0%} 이상 {diag['pickHitThrRate']:.1%} (전체 평균 {diag['baseHitThrRate']:.1%})")
 
+    if a.regime:
+        regime_report(a, dates, o, h, l, c, v, first, test, ml, syms)
+        return
     if a.custom:
         custom_report(a, dates, o, h, l, c, v, first, test, ml)
         return

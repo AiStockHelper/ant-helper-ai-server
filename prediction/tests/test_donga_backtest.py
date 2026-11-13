@@ -221,3 +221,48 @@ def test_oracle_pick_order_does_not_leak_which_names_will_rise():
     assert abs(head_up - tail_up) < 0.08                                  # 앞쪽 절반과 뒤쪽 절반의 상승 비율이 비슷해야 한다
     overall = np.mean([np.mean(fwd[d][idx] > 0) for d, idx in picks.items()])
     assert 0.55 < overall < 0.75                                          # 전체 적중률은 약 65%
+
+
+def test_risk_off_blocks_buying_and_sells_everything_at_the_next_open():
+    o, h, l, c = panel([FLAT] * 6, [FLAT] * 6)
+    kw = dict(first_day=1, capital=100_000, costs=Costs.none(), alloc="equal", max_positions=1)
+    blocked = np.zeros(6, dtype=bool)
+    blocked[0] = True                                                     # 0 일 종가 후 급락기 판단 → 1 일 시가에 사지 않는다
+    r = simulate(DATES, o, h, l, c, {0: np.array([0])}, risk_off=blocked, **kw)
+    assert r.open_positions == 0 and r.trades_closed == 0 and abs(r.equity[-1] - 100_000) < 1e-6
+    off = np.zeros(6, dtype=bool)
+    off[1] = True                                                         # 매수 후 1 일 종가에 급락기 판단 → 2 일 시가에 전량 정리, 재매수 신호도 무시
+    r = simulate(DATES, o, h, l, c, {0: np.array([0]), 1: np.array([0])}, risk_off=off, **kw)
+    assert r.exits_regime == 1 and r.open_positions == 0 and abs(r.equity[-1] - 100_000) < 1e-6
+
+
+def test_risk_off_liquidation_pays_slippage_and_costs():
+    o, h, l, c = panel([FLAT] * 6, [FLAT] * 6)
+    off = np.zeros(6, dtype=bool)
+    off[1] = True
+    costs = Costs(0.0, 0.002, 0.001)
+    r = simulate(DATES, o, h, l, c, {0: np.array([0])}, first_day=1, capital=100_000, costs=costs, alloc="equal", max_positions=1, risk_off=off)
+    assert r.exits_regime == 1
+    # 10,010원에 9주(90,090원) 매수 → 시가 10,000원 × (1-슬리피지) × (1-세금)으로 9주 매도, 남은 현금 9,910원
+    assert abs(r.equity[-1] - (9_910 + 9 * 9_990 * 0.998)) < 1e-6
+
+
+def test_a_delisted_holding_is_written_down_by_the_recovery_rate():
+    nan = float("nan")
+    col = [10000, 10000, 10000, nan, nan, nan]
+    o = h = l = c = np.array(col, dtype=float).reshape(-1, 1)
+    kw = dict(first_day=1, capital=100_000, costs=Costs.none(), alloc="equal", max_positions=1)
+    half = simulate(DATES, o, h, l, c, {0: np.array([0])}, delist_recovery=0.5, **kw)
+    assert half.exits_delist == 1 and half.open_positions == 0 and abs(half.equity[-1] - 50_000) < 1e-6
+    stuck = simulate(DATES, o, h, l, c, {0: np.array([0])}, **kw)
+    assert stuck.exits_delist == 0 and stuck.open_positions == 1 and abs(stuck.equity[-1] - 100_000) < 1e-6
+    assert abs(half.final_cash - (100_000 + half.closed_pnl - half.open_cost)) < 1e-6
+
+
+def test_regime_signal_uses_only_past_index_values():
+    from tools.donga_strategy_backtest import regime_signal
+    idx = np.concatenate([np.linspace(100, 120, 80), np.linspace(120, 90, 20)])
+    cut = regime_signal(idx[:90], "ma20")
+    full = regime_signal(idx, "ma20")
+    assert np.array_equal(cut, full[:90])                                  # 뒤의 데이터가 앞의 판단을 바꾸지 않는다
+    assert not full[:60].any() and full[-1]                                # 상승장에는 쉬지 않고, 급락이 이어지면 쉰다
