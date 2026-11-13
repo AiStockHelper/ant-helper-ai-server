@@ -63,9 +63,9 @@ def load_panel(db: str, market: str, start: str, min_days: int) -> Tuple[pd.Date
     return dates, syms, {k: v.reindex(index=dates, columns=syms).to_numpy(dtype=float) for k, v in wide.items()}
 
 
-def load_index(symbol: str, start: str) -> Optional[pd.Series]:
+def load_index(symbol: str, start: str, db: str = "candles_max.sqlite") -> Optional[pd.Series]:
     try:
-        con = sqlite3.connect(f"file:{DATA / 'candles_max.sqlite'}?mode=ro", uri=True)
+        con = sqlite3.connect(f"file:{DATA / db}?mode=ro", uri=True)
         df = pd.read_sql_query("select date,close from candle where market='IDX' and symbol=? and date>=? order by date",
                                con, params=(symbol, start))
         con.close()
@@ -122,7 +122,8 @@ def next_day_return(c: np.ndarray) -> np.ndarray:
 
 
 def walk_forward_picks(feat: np.ndarray, c: np.ndarray, v: np.ndarray, test_idx: range, q: float, train_days: int,
-                       retrain_every: int, threshold: float, log: Callable[[str], None]) -> Tuple[Dict[int, np.ndarray], dict]:
+                       retrain_every: int, threshold: float, log: Callable[[str], None],
+                       mask: Optional[np.ndarray] = None) -> Tuple[Dict[int, np.ndarray], dict]:
     """매 retrain_every 거래일마다 최근 train_days 일로 다시 학습해 그다음 구간의 신호를 낸다. T 일 신호는 T 일 종가까지만 쓴다."""
     from sklearn.ensemble import HistGradientBoostingClassifier
     fwd = next_day_return(c)
@@ -130,6 +131,8 @@ def walk_forward_picks(feat: np.ndarray, c: np.ndarray, v: np.ndarray, test_idx:
     picks: Dict[int, np.ndarray] = {}
     hits_up, hits_thr, n_pick, base_thr, base_n = 0, 0, 0, 0, 0
     valid_feat = np.isfinite(feat).sum(axis=-1) >= feat.shape[-1] - 3
+    if mask is not None:       # 그날의 유니버스(예: 그날의 S&P 500 구성종목)만 학습·선정에 쓴다
+        valid_feat &= mask
     first = test_idx.start
     for block_start in range(first, test_idx.stop, retrain_every):
         block = range(block_start, min(block_start + retrain_every, test_idx.stop))
@@ -171,11 +174,11 @@ def walk_forward_picks(feat: np.ndarray, c: np.ndarray, v: np.ndarray, test_idx:
     return picks, diag
 
 
-def random_picks(c: np.ndarray, v: np.ndarray, days: range, q: float, seed: int) -> Dict[int, np.ndarray]:
+def random_picks(c: np.ndarray, v: np.ndarray, days: range, q: float, seed: int, mask: Optional[np.ndarray] = None) -> Dict[int, np.ndarray]:
     rng = np.random.default_rng(seed)
     out: Dict[int, np.ndarray] = {}
     for d in days:
-        idx = np.flatnonzero(np.isfinite(c[d]) & (v[d] > 0))
+        idx = np.flatnonzero(np.isfinite(c[d]) & (v[d] > 0) & (mask[d] if mask is not None else True))
         if len(idx) >= 30:
             out[d] = rng.choice(idx, size=max(1, int(round(len(idx) * q))), replace=False)
     return out
@@ -227,10 +230,14 @@ def simulate(dates: pd.DatetimeIndex, o, h, l, c, picks: Dict[int, np.ndarray], 
              take_profit: float = 0.02, stop: Optional[float] = None, max_hold: Optional[int] = None, same_day_exit: bool = False,
              skip_held: bool = False, alloc: str = "shares", max_positions: int = 20, same_bar: str = "stop",
              adv: Optional[np.ndarray] = None, adv_cap: float = 0.0, risk_off: Optional[np.ndarray] = None,
-             delist_recovery: Optional[float] = None) -> Result:
+             delist_recovery: Optional[float] = None, usd: bool = False) -> Result:
     """risk_off[t] 가 True 면 t 일 종가 후 '급락기'로 판단한 것이다: t+1 시가에 보유 종목을 모두 팔고(시장가, 슬리피지 반영) 신규 매수를 멈춘다.
     delist_recovery 가 있으면 데이터가 끝난(상장폐지) 종목을 들고 있을 때 마지막 종가 × 그 비율로 정리한다(None 이면 마지막 종가로 계속 평가)."""
     D, S = c.shape
+    if usd:       # 미국 주식은 호가 단위가 1센트
+        ceil_tick, floor_tick = (lambda p: np.ceil(p * 100 - 1e-9) / 100), (lambda p: np.floor(p * 100 + 1e-9) / 100)    # noqa: F811
+    else:
+        ceil_tick, floor_tick = globals()["ceil_tick"], globals()["floor_tick"]
     valid_c = np.isfinite(c)
     last_idx = np.where(valid_c.any(axis=0), D - 1 - np.argmax(valid_c[::-1], axis=0), -1)     # 종목별 마지막 시세가 있는 날
     shares = np.zeros(S)
@@ -620,9 +627,123 @@ def regime_report(a, dates, o, h, l, c, v, first, test, ml, syms) -> None:
     print(f"\n저장: {out}")
 
 
+def member_mask(dates: pd.DatetimeIndex, syms: List[str], db: str) -> np.ndarray:
+    """(날짜, 종목) → 그날 S&P 500 구성종목이면 True. 편입일~편출일(포함) 기준이라 미래에 편입될 종목을 미리 쓰지 않는다."""
+    con = sqlite3.connect(f"file:{DATA / db}?mode=ro", uri=True)
+    rows = con.execute("select ticker, start_date, end_date from member").fetchall()
+    con.close()
+    pos = {s: k for k, s in enumerate(syms)}
+    mask = np.zeros((len(dates), len(syms)), dtype=bool)
+    for t, s, e in rows:
+        k = pos.get(t)
+        if k is None:
+            continue
+        lo = dates.searchsorted(pd.Timestamp(s))
+        hi = dates.searchsorted(pd.Timestamp(e), side="right") if e else len(dates)
+        mask[lo:hi, k] = True
+    return mask
+
+
+def us_report(a, dates, syms, o, h, l, c, v) -> None:
+    """미국: 그날의 S&P 500 구성종목(또는 그중 거래대금 상위)에서만 ML 로 고르고, 같은 매매 규칙·급락기 필터를 적용한다."""
+    db = "candles_us_sp500.sqlite"
+    capital = a.capital if a.capital != 30_000_000 else 50_000.0
+    cost = Costs(commission=0.0001, sell_tax=0.00003, slippage=0.0005)      # 수수료 1bp, 매도 규정 수수료 0.3bp, 슬리피지 5bp
+    first = max(int(dates.searchsorted(pd.Timestamp(a.start or "2016-01-01"))), 80)
+    test = range(first, len(dates) - 1)
+    train_days = min(a.train_days, first - 60)
+    members = member_mask(dates, syms, db)
+    has = np.isfinite(c) & (v > 0)
+    print(f"데이터: us | 종목 {len(syms):,} | {dates[0].date()} ~ {dates[-1].date()} ({len(dates):,}거래일) | 시험 {dates[first].date()} ~ (자본 ${capital:,.0f}, 비용: 수수료 1bp·매도 0.3bp·슬리피지 5bp)", flush=True)
+
+    # 구성종목 중 시세가 실제로 있는 비율(파산·피인수 종목은 Yahoo 에 없어 빠진다)
+    cov = {}
+    for y in range(dates[first].year, dates[-1].year + 1):
+        m = np.asarray(dates.year == y)
+        cov[y] = float((members[m] & has[m]).sum() / max(1, members[m].sum())) * 100
+    print("\n== 그날의 구성종목 중 시세가 확보된 비율(%) — 낮을수록 사라진 종목이 빠져 있어 낙관적")
+    print(pd.Series(cov).round(1).to_string())
+
+    adv = pd.DataFrame(c * v).rolling(20, min_periods=15).mean().to_numpy()
+    rank = pd.DataFrame(np.where(members & has, adv, np.nan)).rank(axis=1, ascending=False).to_numpy()
+    universes = {"S&P500 그날 구성종목": (members & has, a.q), "구성종목 중 거래대금 상위 100": (members & has & (rank <= 100), 0.30)}
+
+    feat = build_features(o, h, l, c, v)
+    picks: Dict[str, Dict[int, np.ndarray]] = {}
+    for name, (m, q) in universes.items():
+        ml, diag = walk_forward_picks(feat, c, v, test, q, train_days, a.retrain_every, a.threshold, lambda s: None, mask=m)
+        picks[name] = ml
+        print(f"  [{name}] 신호 {diag['pickDays']}일, 하루 평균 {diag['avgPicksPerDay']:.0f}종목 | 다음날 상승 적중 {diag['pickUpRate']:.1%} | "
+              f"다음날 +{a.threshold:.0%} 이상 {diag['pickHitThrRate']:.1%} (전체 평균 {diag['baseHitThrRate']:.1%})", flush=True)
+    del feat
+
+    gspc = load_index("^GSPC", "2011-06-01", db)
+    idx = gspc.reindex(dates).ffill().to_numpy()
+    offs = {"S&P500 60일선 아래": regime_signal(idx, "ma60"), "S&P500 20일선 아래": regime_signal(idx, "ma20")}
+    print("\n== 급락기 판단 비중(%): " + ", ".join(f"{k} {ov[first:].mean() * 100:.0f}" for k, ov in offs.items()))
+
+    def run(pk, stop, off=None, costs=cost, **kw):
+        return simulate(dates, o, h, l, c, pk, first, capital, costs, take_profit=a.threshold, stop=stop, max_hold=a.max_hold, skip_held=True,
+                        alloc="equal", max_positions=a.max_positions, same_bar=kw.pop("same_bar", a.same_bar), adv=adv, adv_cap=a.adv_cap,
+                        risk_off=off, delist_recovery=1.0, usd=True, **kw)
+
+    pd.set_option("display.width", 250)
+    pd.set_option("display.max_columns", 40)
+    cols = ["총수익률%", "연환산%", "최대낙폭%", "승률%", "거래당순수익%", "평균투자비중%", "매도건수", "급락정리%"]
+    allrows: Dict[str, Result] = {}
+    stop_tag = "손절 -%d%%" % round(a.stop * 100)
+    for uname, pk in picks.items():
+        for tag, stop in ((stop_tag, a.stop), ("손절 없음", None)):
+            rows = {"필터 없음": run(pk, stop)}
+            for on, ov in offs.items():
+                rows[on] = run(pk, stop, ov)
+            rows["비용 없음"] = run(pk, stop, costs=Costs.none())
+            m, q = universes[uname]
+            rnd = [run(random_picks(c, v, test, q, 700 + s, mask=m), stop) for s in range(a.seeds)]
+            mid = float(np.median([x.final_net for x in rnd]))
+            rows["[비교] 무작위 선정"] = min(rnd, key=lambda r: abs(r.final_net - mid))
+            t = pd.DataFrame({k: stats(r, first, capital) for k, r in rows.items()}).T
+            t.insert(0, "최종자산($)", [rows[k].final_net for k in t.index])
+            print(f"\n== [{uname}] ML 예측 · 익절 +{a.threshold:.0%} · {tag} · {a.max_hold}영업일 후 정리 · 균등 {a.max_positions}종목 · 자본 ${capital:,.0f}")
+            print(t[["최종자산($)"] + cols].round(1).to_string())
+            for k, r in rows.items():
+                allrows[f"{uname} | {tag} | {k}"] = r
+
+    main_pk = picks["S&P500 그날 구성종목"]
+    print("\n== 같은 날 손절·익절이 함께 닿을 때의 가정에 따른 범위 (구성종목 · 필터 없음)")
+    rng_rows = {}
+    for tag, stop in ((stop_tag, a.stop), ("손절 없음", None)):
+        for mode, nm in (("stop", "손절 먼저"), ("random", "동전 던지기"), ("target", "익절 먼저")):
+            s = stats(run(main_pk, stop, same_bar=mode), first, capital)
+            rng_rows[f"{tag} · {nm}"] = {k: s[k] for k in ("연환산%", "총수익률%", "최대낙폭%", "승률%")}
+    print(pd.DataFrame(rng_rows).T.round(1).to_string())
+
+    rets = np.where(members[1:] & has[1:] & has[:-1], c[1:] / c[:-1] - 1, np.nan)
+    ew = pd.Series(np.concatenate([[0.0], np.nan_to_num(np.nanmean(rets, axis=1))]), index=dates)
+    yrs = (dates[-1] - dates[first]).days / 365.25
+    ew_total = float(np.prod(1 + ew.iloc[first:].to_numpy()) - 1)
+    sp_total = float(idx[-1] / idx[first] - 1)
+    print(f"\n기준선: S&P 500 지수 {sp_total * 100:+.0f}% (연 {((1 + sp_total) ** (1 / yrs) - 1) * 100:.1f}%) | "
+          f"그날 구성종목 동일비중 보유(매일 재조정, 비용 제외) {ew_total * 100:+.0f}% (연 {((1 + ew_total) ** (1 / yrs) - 1) * 100:.1f}%)")
+
+    u = "S&P500 그날 구성종목"
+    pick_rows = [f"{u} | {stop_tag} | 필터 없음", f"{u} | 손절 없음 | 필터 없음", f"{u} | 손절 없음 | S&P500 60일선 아래"]
+    y = pd.DataFrame({k.split(" | ", 1)[1].replace(" | ", "·"): yearly(allrows[k], first) for k in pick_rows}).round(1)
+    y["구성종목 동일비중 보유"] = ew.iloc[first:].groupby(ew.index[first:].year).apply(lambda s: (np.prod(1 + s) - 1) * 100).round(1)
+    gy = gspc[gspc.index >= dates[first] - pd.Timedelta(days=7)]
+    gy = gy.groupby(gy.index.year).last()
+    y["S&P500"] = ((gy / gy.shift(1) - 1) * 100).reindex(y.index).round(1)
+    print("\n== 연도별 수익률(%)")
+    print(y.to_string())
+    OUT.mkdir(parents=True, exist_ok=True)
+    out = OUT / "donga_backtest_us.csv"
+    pd.DataFrame({k: stats(r, first, capital) for k, r in allrows.items()}).T.round(4).to_csv(out, encoding="utf-8-sig")
+    print(f"\n저장: {out}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("dataset", choices=["long", "broad", "all"])
+    ap.add_argument("dataset", choices=["long", "broad", "all", "us"])
     ap.add_argument("--regime", action="store_true", help="급락기 현금 보유 필터를 비교한다(dataset=all 권장: 상장폐지 종목 포함)")
     ap.add_argument("--reuse-picks", action="store_true", help="저장된 ML 신호(pickle)가 있으면 다시 학습하지 않는다")
     ap.add_argument("--start", default=None, help="시험 시작일(기본: long=2016-01-01, broad=전체의 뒤 40%)")
@@ -644,6 +765,10 @@ def main() -> None:
     if a.dataset == "long":
         dates, syms, p = load_panel("candles_max.sqlite", "KRX", "2012-01-01", 600)
         start = a.start or "2016-01-01"
+    elif a.dataset == "us":
+        dates, syms, p = load_panel("candles_us_sp500.sqlite", "US", "2012-01-01", 120)
+        us_report(a, dates, syms, p["open"], p["high"], p["low"], p["close"], p["volume"])
+        return
     elif a.dataset == "all":
         dates, syms, p = load_panel("candles_krx_all.sqlite", "KRX", "2014-01-01", 120)
         start = a.start or "2016-01-01"

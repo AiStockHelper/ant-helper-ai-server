@@ -266,3 +266,42 @@ def test_regime_signal_uses_only_past_index_values():
     full = regime_signal(idx, "ma20")
     assert np.array_equal(cut, full[:90])                                  # 뒤의 데이터가 앞의 판단을 바꾸지 않는다
     assert not full[:60].any() and full[-1]                                # 상승장에는 쉬지 않고, 급락이 이어지면 쉰다
+
+
+def test_usd_tick_uses_one_cent_limit_prices():
+    p = 150.05
+    col = [(p, p, p, p), (p, p, p, p), (p, 153.5, p, p), (p, p, p, p), (p, p, p, p), (p, p, p, p)]
+    o, h, l, c = panel(col, col)
+    kw = dict(first_day=1, capital=1500.5, costs=Costs.none(), alloc="equal", max_positions=1)
+    usd = simulate(DATES, o, h, l, c, {0: np.array([0])}, usd=True, **kw)
+    krw = simulate(DATES, o, h, l, c, {0: np.array([0])}, usd=False, **kw)
+    assert usd.exits_take_profit == 1                  # 익절가 153.051 → 1센트 올림 153.06 ≤ 고가 153.5
+    assert krw.exits_take_profit == 0                  # 원화 호가(1원 단위)면 154 라서 닿지 않는다
+
+
+def test_member_mask_only_covers_the_membership_window(tmp_path, monkeypatch):
+    import sqlite3
+    import tools.donga_strategy_backtest as B
+    con = sqlite3.connect(tmp_path / "m.sqlite")
+    con.execute("create table member (ticker text, start_date text, end_date text)")
+    con.executemany("insert into member values (?,?,?)", [("AAA", "2026-01-07", "2026-01-08"), ("BBB", "2026-01-05", None)])
+    con.commit()
+    con.close()
+    monkeypatch.setattr(B, "DATA", tmp_path)
+    mask = B.member_mask(DATES, ["AAA", "BBB", "CCC"], "m.sqlite")
+    assert mask[:, 0].tolist() == [False, False, True, True, False, False]       # 편입일~편출일(포함)만
+    assert mask[:, 1].all() and not mask[:, 2].any()                              # 편출일 없음=계속 구성종목, 이력 없는 종목은 제외
+
+
+def test_walk_forward_universe_mask_excludes_non_members():
+    from tools.donga_strategy_backtest import walk_forward_picks, build_features
+    rng = np.random.default_rng(1)
+    D, S = 400, 60
+    c = np.cumprod(1 + rng.normal(0, 0.02, size=(D, S)), axis=0) * 100
+    o, h, l = c * 0.999, c * 1.01, c * 0.99
+    v = np.full_like(c, 1e6)
+    feat = build_features(o, h, l, c, v)
+    mask = np.zeros((D, S), dtype=bool)
+    mask[:, :30] = True
+    picks, _ = walk_forward_picks(feat, c, v, range(300, 380), 0.3, 200, 20, 0.02, lambda s: None, mask=mask)
+    assert picks and all((idx < 30).all() for idx in picks.values())
