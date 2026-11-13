@@ -193,7 +193,7 @@ def oracle_picks(c: np.ndarray, v: np.ndarray, days: range, q: float, accuracy: 
         k_up = min(len(up), int(round(k * accuracy)))
         k_dn = min(len(down), k - k_up)
         if k_up + k_dn >= 10:
-            out[d] = np.concatenate([rng.choice(up, k_up, replace=False), rng.choice(down, k_dn, replace=False)])
+            out[d] = rng.permutation(np.concatenate([rng.choice(up, k_up, replace=False), rng.choice(down, k_dn, replace=False)]))
     return out
 
 
@@ -211,10 +211,20 @@ class Result:
     open_value_share: float
     avg_invested_share: float
     final_net: float
+    exits_take_profit: int = 0
+    exits_stop: int = 0
+    exits_expire: int = 0
+    avg_trade_net: float = float("nan")
+    closed_pnl: float = 0.0
+    closed_cost: float = 0.0
+    final_cash: float = 0.0
+    open_cost: float = 0.0
 
 
 def simulate(dates: pd.DatetimeIndex, o, h, l, c, picks: Dict[int, np.ndarray], first_day: int, capital: float, costs: Costs,
-             take_profit: float = 0.02, stop: Optional[float] = None, max_hold: Optional[int] = None, same_day_exit: bool = False) -> Result:
+             take_profit: float = 0.02, stop: Optional[float] = None, max_hold: Optional[int] = None, same_day_exit: bool = False,
+             skip_held: bool = False, alloc: str = "shares", max_positions: int = 20, same_bar: str = "stop",
+             adv: Optional[np.ndarray] = None, adv_cap: float = 0.0) -> Result:
     D, S = c.shape
     shares = np.zeros(S)
     paid = np.zeros(S)           # 매수 체결가 합(수수료 제외)
@@ -225,12 +235,41 @@ def simulate(dates: pd.DatetimeIndex, o, h, l, c, picks: Dict[int, np.ndarray], 
     invested_share: List[float] = []
     closed_ret: List[float] = []
     closed_days: List[int] = []
+    closed_net: List[float] = []
+    pnl_sum = 0.0
+    cost_sum = 0.0
+    exit_counts = {1: 0, 2: 0, 3: 0}
     comm, tax, slip = costs.commission, costs.sell_tax, costs.slippage
+    rng = np.random.default_rng(12345)
 
     for d in range(first_day, D):
         bought_today = np.zeros(S, dtype=bool)
         # 1) 전일 종가 신호 → 오늘 시가에 매수: 싼 종목부터 1주씩, 돈이 남으면 다시 싼 종목부터
         idx = picks.get(d - 1)
+        if idx is not None and skip_held:
+            idx = idx[shares[idx] == 0]          # 이미 들고 있는 종목은 더 사지 않는다(매수별 보유 기간이 어긋나지 않게)
+        if alloc == "equal" and idx is not None and len(idx):
+            # 종목별 균등 금액: 자산의 1/max_positions 씩, 신호 순위(확률 높은 순)대로 빈 자리만큼 산다
+            free = max_positions - int((shares > 0).sum())
+            if free > 0:
+                slot = (cash + float((shares * last).sum())) / max_positions
+                for k in idx:
+                    if free <= 0:
+                        break
+                    if not (np.isfinite(o[d, k]) and o[d, k] > 0) or shares[k] > 0:
+                        continue
+                    unit_k = o[d, k] * (1 + slip) * (1 + comm)
+                    qty = int(min(slot, cash) // unit_k)
+                    if adv is not None and adv_cap > 0:
+                        room = adv[d - 1, k]
+                        qty = min(qty, int(adv_cap * room // unit_k) if np.isfinite(room) else 0)
+                    if qty >= 1:
+                        cash -= qty * unit_k
+                        shares[k] += qty
+                        paid[k] += o[d, k] * (1 + slip) * qty
+                        bought_today[k] = True
+                        free -= 1
+            idx = None
         if idx is not None and len(idx):
             px = o[d, idx]
             ok = np.isfinite(px) & (px > 0) & np.isfinite(c[d - 1, idx])
@@ -253,17 +292,31 @@ def simulate(dates: pd.DatetimeIndex, o, h, l, c, picks: Dict[int, np.ndarray], 
             can = held & (~bought_today | same_day_exit) & np.isfinite(h[d]) & np.isfinite(l[d]) & np.isfinite(o[d])
             fill = np.full(S, np.nan)
             reason = np.zeros(S, dtype=int)
+            tp_px = ceil_tick(avg * (1 + take_profit))
+            hit_tp = can & (h[d] >= tp_px)
             if stop is not None:
                 stop_px = floor_tick(avg * (1 - stop))
                 hit_stop = can & (l[d] <= stop_px)
-                fill = np.where(hit_stop, np.minimum(o[d], stop_px) * (1 - slip), fill)
-                reason = np.where(hit_stop, 2, reason)
-            tp_px = ceil_tick(avg * (1 + take_profit))
-            hit_tp = can & (reason == 0) & (h[d] >= tp_px)
+                both = hit_stop & hit_tp
+                # 일봉으로는 같은 날 손절·익절 중 무엇이 먼저인지 알 수 없다. 갭(시가가 이미 한쪽을 넘음)이면 그쪽이 먼저이고,
+                # 그 외에는 same_bar 가정을 따른다: stop=손절 먼저(보수적), target=익절 먼저(낙관적), random=동전 던지기(기댓값)
+                gap_down = o[d] <= stop_px
+                gap_up = o[d] >= tp_px
+                if same_bar == "stop":
+                    first_stop = np.ones(S, dtype=bool)
+                elif same_bar == "target":
+                    first_stop = np.zeros(S, dtype=bool)
+                else:
+                    first_stop = rng.random(S) < 0.5
+                final_stop = (hit_stop & ~hit_tp) | (both & (gap_down | (~gap_up & first_stop)))
+                hit_tp = hit_tp & ~final_stop
+                fill = np.where(final_stop, np.minimum(o[d], stop_px) * (1 - slip), fill)
+                reason = np.where(final_stop, 2, reason)
             fill = np.where(hit_tp, np.maximum(o[d], tp_px), fill)        # 갭 상승이면 시가에, 아니면 지정가에 체결
-            reason = np.where(hit_tp, 1, reason)
+            reason = np.where(hit_tp & (reason == 0), 1, reason)
             if max_hold is not None:
-                expire = can & (reason == 0) & (age + 1 >= max_hold) & np.isfinite(c[d])
+                # age 는 '매수일 이후 지난 영업일 수'다(매수일 종가 처리 뒤 1). max_hold=5 면 매수일로부터 5영업일째 종가에 정리한다.
+                expire = can & (reason == 0) & (age >= max_hold) & np.isfinite(c[d])
                 fill = np.where(expire, c[d] * (1 - slip), fill)
                 reason = np.where(expire, 3, reason)
             sold = reason > 0
@@ -271,6 +324,12 @@ def simulate(dates: pd.DatetimeIndex, o, h, l, c, picks: Dict[int, np.ndarray], 
                 proceeds = shares[sold] * fill[sold] * (1 - comm - tax)
                 cash += float(proceeds.sum())
                 closed_ret.extend(((fill[sold] - avg[sold]) / avg[sold]).tolist())
+                # 비용을 모두 뺀 거래당 수익률: 매수 수수료는 평균가에 얹고, 매도는 수수료·세금을 뺀다
+                closed_net.extend(((fill[sold] * (1 - comm - tax) - avg[sold] * (1 + comm)) / (avg[sold] * (1 + comm))).tolist())
+                pnl_sum += float((shares[sold] * (fill[sold] * (1 - comm - tax) - avg[sold] * (1 + comm))).sum())
+                cost_sum += float((shares[sold] * avg[sold] * (1 + comm)).sum())
+                for code in reason[sold]:
+                    exit_counts[int(code)] += 1
                 closed_days.extend((age[sold] + 1).tolist())
                 shares[sold] = 0.0
                 paid[sold] = 0.0
@@ -297,6 +356,9 @@ def simulate(dates: pd.DatetimeIndex, o, h, l, c, picks: Dict[int, np.ndarray], 
         open_value_share=total / equity[-1] if equity[-1] > 0 else 0.0,
         avg_invested_share=float(np.mean(invested_share)) if invested_share else 0.0,
         final_net=final_net,
+        exits_take_profit=exit_counts[1], exits_stop=exit_counts[2], exits_expire=exit_counts[3],
+        avg_trade_net=float(np.mean(closed_net)) if closed_net else float("nan"),
+        closed_pnl=pnl_sum, closed_cost=cost_sum, final_cash=cash, open_cost=float((paid * (1 + comm)).sum()),
     )
 
 
@@ -319,6 +381,11 @@ def stats(r: Result, first_day: int, capital: float) -> dict:
         "미청산종목": r.open_positions,
         "미청산중 손실비중%": r.open_underwater_value_share * 100,
         "평균투자비중%": r.avg_invested_share * 100,
+        "거래당순수익%": r.avg_trade_net * 100,
+        "금액가중수익%": (r.closed_pnl / r.closed_cost * 100) if r.closed_cost > 0 else float("nan"),
+        "익절%": r.exits_take_profit / max(1, r.trades_closed) * 100,
+        "손절%": r.exits_stop / max(1, r.trades_closed) * 100,
+        "만료%": r.exits_expire / max(1, r.trades_closed) * 100,
     }
 
 
@@ -327,6 +394,106 @@ def yearly(r: Result, first_day: int) -> pd.Series:
     ye = s.groupby(s.index.year).last()
     prev = pd.concat([pd.Series([s.iloc[0]], index=[ye.index[0] - 1]), ye]).shift(1).iloc[1:]
     return (ye / prev - 1) * 100
+
+
+def window_return(r: Result, dates: pd.DatetimeIndex, years: float) -> float:
+    """마지막 날로부터 years 년 전 이후의 평가자산 변화율(%). 구간이 부족하면 nan."""
+    end = len(dates) - 1
+    start = int(dates.searchsorted(dates[end] - pd.Timedelta(days=int(years * 365.25))))
+    if start >= end or not np.isfinite(r.equity[start]):
+        return float("nan")
+    return (r.equity[end] / r.equity[start] - 1) * 100
+
+
+def custom_report(a, dates, o, h, l, c, v, first, test, ml_picks) -> None:
+    """사용자 지정 규칙(익절·손절·N영업일 후 정리)으로 예측 매수·매도를 계속 반복했을 때의 결과.
+    배분 방식 두 가지를 모두 낸다: ① 기사식(싼 종목부터 1주씩 → 가격 비중 포트폴리오), ② 종목별 균등 금액(앱 스킬과 비슷)."""
+    tp, sl, hold = a.threshold, a.stop, a.max_hold
+    cost = Costs()
+    label = f"익절 +{tp:.0%} · 손절 -{sl:.0%} · {hold}영업일 후 정리"
+    mp = a.max_positions
+    adv = pd.DataFrame(c * v).rolling(20, min_periods=15).mean().to_numpy()   # 20일 평균 거래대금(원)
+
+    def run(picks, costs=cost, alloc="equal", **kw):
+        base = dict(take_profit=tp, stop=sl, max_hold=hold, skip_held=True, alloc=alloc, max_positions=mp, same_bar=a.same_bar, adv=adv, adv_cap=a.adv_cap)
+        base.update(kw)
+        return simulate(dates, o, h, l, c, picks, first, a.capital, costs, **base)
+
+    def median_of(make, **kw):
+        res = [run(make(s), **kw) for s in range(a.seeds)]
+        mid = float(np.median([x.final_net for x in res]))
+        return min(res, key=lambda r: abs(r.final_net - mid))
+
+    rnd = lambda s: random_picks(c, v, test, a.q, 400 + s)  # noqa: E731
+    rows: Dict[str, Result] = {}
+    for alloc, tag, name in (("equal", "균등", f"종목별 균등 금액(최대 {mp}종목, 앱 스킬과 비슷)"), ("shares", "기사식", "싼 종목부터 1주씩(기사 방식)")):
+        rows[f"[{tag}] ML 예측 · {label}"] = run(ml_picks, alloc=alloc)
+        rows[f"[{tag}]  └ 비용 없음"] = run(ml_picks, Costs.none(), alloc=alloc)
+        rows[f"[{tag}]  └ 손절만 뺌(기간 정리는 유지)"] = run(ml_picks, alloc=alloc, stop=None)
+        rows[f"[{tag}] 무작위 선정 · 같은 규칙"] = median_of(rnd, alloc=alloc)
+        for acc in (0.55, 0.65):
+            rows[f"[{tag}] 가상 예측기 적중 {acc:.0%} · 같은 규칙"] = median_of(lambda s, acc=acc: oracle_picks(c, v, test, a.q, acc, 500 + s), alloc=alloc)
+    rows["[참고] 기사 원본(손절·기간정리 없음, 1주씩)"] = simulate(dates, o, h, l, c, ml_picks, first, a.capital, cost, take_profit=tp)
+
+    table = pd.DataFrame({k: stats(r, first, a.capital) for k, r in rows.items()}).T
+    pd.set_option("display.width", 280)
+    pd.set_option("display.max_columns", 40)
+    pd.set_option("display.max_colwidth", 70)
+    print(f"\n== 시나리오별 결과 (자본 {a.capital:,.0f}원, 시험 {dates[first].date()} ~ {dates[-1].date()}, {(dates[-1] - dates[first]).days / 365.25:.1f}년)")
+    cols = ["최종자산(만원)", "총수익률%", "연환산%", "일평균%", "최대낙폭%", "매도건수", "승률%", "거래당순수익%", "금액가중수익%", "평균보유일", "익절%", "손절%", "만료%", "평균투자비중%"]
+    print(table[cols].round(2).to_string())
+
+    # 회계 검증: 최종 현금 = 자본 + 확정 손익 - 미청산 원가
+    worst = max(abs(r.final_cash - (a.capital + r.closed_pnl - r.open_cost)) for r in rows.values())
+    print(f"\n[회계 검증] 모든 시나리오에서 '최종 현금 = 자본 + 확정손익 - 미청산 원가' 최대 오차 {worst:,.4f}원")
+
+    key = f"[균등] ML 예측 · {label}"
+    # 같은 날 손절·익절 순서 가정에 따른 범위(균등·ML): 일봉으로는 알 수 없어서 양 끝과 기댓값을 모두 보여 준다
+    rng_rows = {}
+    for mode, nm in (("stop", "손절 먼저(보수적)"), ("random", "동전 던지기(기댓값)"), ("target", "익절 먼저(낙관적)")):
+        s = stats(run(ml_picks, same_bar=mode), first, a.capital)
+        rng_rows[nm] = {"연환산%": s["연환산%"], "총수익률%": s["총수익률%"], "최대낙폭%": s["최대낙폭%"], "승률%": s["승률%"], "익절%": s["익절%"], "손절%": s["손절%"]}
+    print("\n== 같은 날 손절·익절이 함께 닿을 때의 가정에 따른 범위 (균등 배분 · ML 예측 · 비용 반영)")
+    print(pd.DataFrame(rng_rows).T.round(2).to_string())
+
+    best = rows[key]
+    n = max(1, best.trades_closed)
+    print(f"\n[{key}] 청산 구성: 익절 {best.exits_take_profit / n:.1%} · 손절 {best.exits_stop / n:.1%} · 기간만료 {best.exits_expire / n:.1%}"
+          f" | 거래 {best.trades_closed:,}건, 거래당 순수익 {best.avg_trade_net * 100:+.3f}%, 금액가중 {best.closed_pnl / max(best.closed_cost, 1) * 100:+.3f}%")
+    print(f"[참고] 익절 +{tp:.0%} / 손절 -{sl:.0%} 에서 비용 없이 본전인 승률은 {sl / (tp + sl) * 100:.0f}%, 왕복 비용 약 {(cost.commission * 2 + cost.sell_tax + cost.slippage * 2) * 100:.2f}%를 감안하면 더 높다")
+
+    # 민감도(균등 배분, ML 신호 고정, 비용 반영): 손절 폭 × 보유 기간
+    grid = {}
+    for stop_v in (0.01, 0.02, 0.03, 0.05, None):
+        row = {}
+        for hold_v in (3, 5, 10):
+            r = run(ml_picks, stop=stop_v, max_hold=hold_v)
+            row[f"{hold_v}영업일"] = stats(r, first, a.capital)["연환산%"]
+        grid[f"손절 -{stop_v:.0%}" if stop_v else "손절 없음"] = row
+    print(f"\n== 민감도(균등 배분): 익절 +{tp:.0%} 고정, 연환산 수익률(%) — 손절 폭 × 보유 기간")
+    print(pd.DataFrame(grid).T.round(1).to_string())
+
+    rets = c[first:] / c[first - 1:-1] - 1
+    ew = np.nanmean(np.where(np.isfinite(rets), rets, np.nan), axis=1)
+    ew_series = pd.Series(ew, index=dates[first:first + len(ew)]).fillna(0.0)
+    ew_total = float(np.prod(1 + ew_series.to_numpy()) - 1) * 100
+    kospi = load_index("^KS11", str(dates[first].date()))
+    print(f"\n기준선: 같은 종목 동일비중 보유(매일 재조정, 비용 제외) {ew_total:+.1f}%"
+          + (f" | 코스피 {kospi.iloc[-1] / kospi.iloc[0] * 100 - 100:+.1f}%" if kospi is not None and len(kospi) > 10 else ""))
+
+    show = [key, "[균등] 무작위 선정 · 같은 규칙", "[기사식] ML 예측 · " + label, "[참고] 기사 원본(손절·기간정리 없음, 1주씩)"]
+    short = {key: "균등·ML", "[균등] 무작위 선정 · 같은 규칙": "균등·무작위", "[기사식] ML 예측 · " + label: "기사식·ML", "[참고] 기사 원본(손절·기간정리 없음, 1주씩)": "기사 원본"}
+    y = pd.DataFrame({short[k]: yearly(rows[k], first) for k in show}).round(1)
+    y["동일비중 보유"] = ew_series.groupby(ew_series.index.year).apply(lambda s: (np.prod(1 + s) - 1) * 100).round(1)
+    print("\n== 연도별 수익률(%)")
+    print(y.to_string())
+    recent = {short[k]: {f"최근 {yr}년": window_return(rows[k], dates, yr) for yr in (1, 3, 5)} for k in show}
+    print("\n== 최근 구간 수익률(%)")
+    print(pd.DataFrame(recent).T.round(1).to_string())
+    OUT.mkdir(parents=True, exist_ok=True)
+    out = OUT / f"donga_backtest_custom_{a.dataset}.csv"
+    table.round(4).to_csv(out, encoding="utf-8-sig")
+    print(f"\n저장: {out}")
 
 
 def main() -> None:
@@ -339,6 +506,12 @@ def main() -> None:
     ap.add_argument("--train-days", type=int, default=250)
     ap.add_argument("--retrain-every", type=int, default=21)
     ap.add_argument("--seeds", type=int, default=3)
+    ap.add_argument("--same-bar", choices=["stop", "target", "random"], default="random", help="같은 날 손절·익절이 모두 닿을 때 순서 가정(기본 random=동전 던지기)")
+    ap.add_argument("--adv-cap", type=float, default=0.01, help="균등 배분에서 한 종목 매수 금액 상한: 직전 20일 평균 거래대금의 비율(0 이면 제한 없음)")
+    ap.add_argument("--max-positions", type=int, default=20, help="--custom 균등 배분 시 동시 보유 종목 수")
+    ap.add_argument("--custom", action="store_true", help="익절·손절·N영업일 후 정리 규칙으로 예측 매수·매도를 반복한 결과를 낸다")
+    ap.add_argument("--stop", type=float, default=0.02, help="--custom 손절 폭(기본 2%)")
+    ap.add_argument("--max-hold", type=int, default=5, help="--custom 매수일로부터 정리까지의 영업일(기본 5)")
     a = ap.parse_args()
     log = lambda s: print(s, flush=True)  # noqa: E731
 
@@ -364,6 +537,10 @@ def main() -> None:
     ml, diag = walk_forward_picks(feat, c, v, test, a.q, train_days, a.retrain_every, a.threshold, lambda s: None)
     log(f"  신호 {diag['pickDays']}일, 하루 평균 {diag['avgPicksPerDay']:.0f}종목 | 고른 종목의 다음날 상승률(적중) {diag['pickUpRate']:.1%} | "
         f"다음날 +{a.threshold:.0%} 이상 {diag['pickHitThrRate']:.1%} (전체 평균 {diag['baseHitThrRate']:.1%})")
+
+    if a.custom:
+        custom_report(a, dates, o, h, l, c, v, first, test, ml)
+        return
 
     cost = Costs()
     rows: Dict[str, Result] = {}
